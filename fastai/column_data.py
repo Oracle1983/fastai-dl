@@ -30,19 +30,19 @@ class ColumnarModelData(ModelData):
             DataLoader(val_ds, bs*2, shuffle=False))
 
     @classmethod
-    def from_data_frames(self, path, trn_df, val_df, trn_y, val_y, cat_flds, bs):
-        return self(path, ColumnarDataset.from_data_frame(trn_df, cat_flds, trn_y),
+    def from_data_frames(cls, path, trn_df, val_df, trn_y, val_y, cat_flds, bs):
+        return cls(path, ColumnarDataset.from_data_frame(trn_df, cat_flds, trn_y),
                     ColumnarDataset.from_data_frame(val_df, cat_flds, val_y), bs)
 
     @classmethod
-    def from_data_frame(self, path, val_idxs, df, y, cat_flds, bs):
+    def from_data_frame(cls, path, val_idxs, df, y, cat_flds, bs):
         ((val_df, trn_df), (val_y, trn_y)) = split_by_idx(val_idxs, df, y)
-        return self.from_data_frames(path, trn_df, val_df, trn_y, val_y, cat_flds, bs)
+        return cls.from_data_frames(path, trn_df, val_df, trn_y, val_y, cat_flds, bs)
 
     def get_learner(self, emb_szs, n_cont, emb_drop, out_sz, szs, drops,
                     y_range=None, use_bn=False):
         model = MixedInputModel(emb_szs, n_cont, emb_drop, out_sz, szs, drops, y_range, use_bn)
-        return StructuredLearner(self, StructuredModel(model.cuda()), opt_fn=optim.Adam)
+        return StructuredLearner(self, StructuredModel(to_gpu(model)), opt_fn=optim.Adam)
 
 
 def emb_init(x):
@@ -112,13 +112,13 @@ class CollabFilterDataset(Dataset):
         self.cols = [self.user_col,self.item_col,self.ratings]
 
     @classmethod
-    def from_data_frame(self, path, df, user_name, item_name, rating_name):
-        return self(path, df[user_name], df[item_name], df[rating_name])
+    def from_data_frame(cls, path, df, user_name, item_name, rating_name):
+        return cls(path, df[user_name], df[item_name], df[rating_name])
 
     @classmethod
-    def from_csv(self, path, csv, user_name, item_name, rating_name):
+    def from_csv(cls, path, csv, user_name, item_name, rating_name):
         df = pd.read_csv(os.path.join(path,csv))
-        return self.from_data_frame(path, df, user_name, item_name, rating_name)
+        return cls.from_data_frame(path, df, user_name, item_name, rating_name)
 
     def proc_col(self,col):
         uniq = col.unique()
@@ -134,7 +134,7 @@ class CollabFilterDataset(Dataset):
 
     def get_model(self, n_factors):
         model = EmbeddingDotBias(n_factors, self.n_users, self.n_items, self.min_score, self.max_score)
-        return CollabFilterModel(model.cuda())
+        return CollabFilterModel(to_gpu(model))
 
     def get_learner(self, n_factors, val_idxs, bs, **kwargs):
         return CollabFilterLearner(self.get_data(val_idxs, bs), self.get_model(n_factors), **kwargs)

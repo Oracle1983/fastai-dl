@@ -28,21 +28,9 @@ class Learner():
         self.opt_fn = opt_fn or SGD_Momentum(0.9)
         self.tmp_path = os.path.join(self.data.path, tmp_name)
         self.models_path = os.path.join(self.data.path, models_name)
-        if not os.path.exists(self.tmp_path):
-            try:
-                os.mkdir(self.tmp_path)
-                if not os.path.exists(self.models_path): os.mkdir(self.models_path)
-            except IOError:
-                print(f'directory {self.tmp_path} is not writable')
-            else:
-                self.tmp_path = os.path.join(os.getenv("HOME"), tmp_name)
-                if not os.path.exists(self.tmp_path): os.mkdir(self.tmp_path)
-                self.models_path = os.path.join(os.getenv("HOME"), models_name)
-                if not os.path.exists(self.models_path): os.mkdir(self.models_path)
-
+        os.makedirs(self.tmp_path, exist_ok=True)
+        os.makedirs(self.models_path, exist_ok=True)
         self.crit,self.reg_fn,self.crit = None,None,None
-
-    def num_features(self): return num_features(self.model)
 
     def __getitem__(self,i): return self.children[i]
 
@@ -55,8 +43,16 @@ class Learner():
     @property
     def data(self): return self.data_
 
+    def summary(self): return model_summary(self.model, [3,self.data.sz,self.data.sz])
+
+    def set_bn_freeze(self, m, do_freeze):
+        if hasattr(m, 'running_mean'): m.bn_freeze = do_freeze
+
+    def bn_freeze(self, do_freeze):
+        apply_leaf(self.model, lambda m: self.set_bn_freeze(m, do_freeze))
+
     def freeze_to(self, n):
-        c=self.children
+        c=self.get_layer_groups()
         for l in c:     set_trainable(l, False)
         for l in c[n:]: set_trainable(l, True)
 
@@ -101,6 +97,38 @@ class Learner():
         self.fit_gen(self.model, self.data, layer_opt, n_cycle, **kwargs)
 
     def lr_find(self, start_lr=1e-5, end_lr=10, wds=None):
+        """Helps you find an optimal learning rate for a model.
+
+         It uses the technique developed in the 2015 paper 
+         `Cyclical Learning Rates for Training Neural Networks`, where 
+         we simply keep increasing the learning rate from a very small value, 
+         until the loss starts decreasing.
+
+        Args:
+            start_lr (float/numpy array) : Passing in a numpy array allows you 
+                to specify learning rates for a learner's layer_groups
+            end_lr (float) : The maximum learning rate to try.
+            wds (iterable/float)
+
+        Examples:
+            As training moves us closer to the optimal weights for a model,
+            the optimal learning rate will be smaller. We can take advantage of
+            that knowledge and provide lr_find() with a starting learning rate
+            1000x smaller than the model's current learning rate as such:
+
+            >> learn.lr_find(lr/1000)
+
+            >> lrs = np.array([ 1e-4, 1e-3, 1e-2 ])
+            >> learn.lr_find(lrs / 1000)
+
+        Notes:
+            lr_find() may finish before going through each batch of examples if
+            the loss decreases enough.
+
+        .. _Cyclical Learning Rates for Training Neural Networks:
+            http://arxiv.org/abs/1506.01186
+
+        """
         self.save('tmp')
         layer_opt = self.get_layer_opt(start_lr, wds)
         self.sched = LR_Finder(layer_opt, len(self.data.trn_dl), end_lr)
@@ -113,11 +141,31 @@ class Learner():
         dl = self.data.test_dl if is_test else self.data.val_dl
         return predict_with_targs(self.model, dl)
 
+    def predict_dl(self, dl): return predict_with_targs(self.model, dl)[0]
+    def predict_array(self, arr): return to_np(self.model(V(T(arr).cuda())))
+
     def TTA(self, n_aug=4, is_test=False):
+        """ Predict with Test Time Augmentation (TTA)
+
+        Additional to the original test/validation images, apply image augmentation to them
+        (just like for training images) and calculate the mean of predictions. The intent
+        is to increase the accuracy of predictions by examining the images using multiple
+        perspectives.
+
+        Args:
+            n_aug: a number of augmentation images to use per original image
+            is_test: indicate to use test images; otherwise use validation images
+
+        Returns:
+            (tuple): a tuple containing:
+
+                log predictions (numpy.ndarray): log predictions (i.e. `np.exp(log_preds)` will return probabilities)
+                targs (numpy.ndarray): target values when `is_test==False`; zeros otherwise.
+        """
         dl1 = self.data.test_dl     if is_test else self.data.val_dl
         dl2 = self.data.test_aug_dl if is_test else self.data.aug_dl
         preds1,targs = predict_with_targs(self.model, dl1)
         preds1 = [preds1]*math.ceil(n_aug/4)
-        preds2 = [predict_with_targs(self.model, dl2)[0] for i in range(n_aug)]
+        preds2 = [predict_with_targs(self.model, dl2)[0] for i in tqdm(range(n_aug), leave=False)] 
         return np.stack(preds1+preds2).mean(0), targs
 

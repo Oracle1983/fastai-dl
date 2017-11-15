@@ -3,7 +3,9 @@ from .torch_imports import *
 from .core import *
 from .layer_optimizer import *
 
-def cut_model(m, cut): return list(m.children())[:cut]
+def cut_model(m, cut):
+    c = list(m.children())
+    return c[:cut] if cut else c
 
 def predict_to_bcolz(m, gen, arr, workers=4):
     lock=threading.Lock()
@@ -16,11 +18,11 @@ def predict_to_bcolz(m, gen, arr, workers=4):
 
 def num_features(m):
     c=children(m)
-    if hasattr(c[-1], 'num_features'): return c[-1].num_features
-    elif hasattr(c[-1], 'out_features'): return c[-1].out_features
-    if hasattr(c[-2], 'num_features'): return c[-2].num_features
-    elif hasattr(c[-2], 'out_features'): return c[-2].out_features
-    return num_features(children(m)[-1])
+    if len(c)==0: return None
+    for l in reversed(c):
+        if hasattr(l, 'num_features'): return l.num_features
+        res = num_features(l)
+        if res is not None: return res
 
 
 class Stepper():
@@ -51,9 +53,9 @@ class Stepper():
         if isinstance(preds,(tuple,list)): preds=preds[0]
         return preds, self.crit(preds,y)
 
-
 def set_train_mode(m):
-    if hasattr(m, 'running_mean') and not (hasattr(m,'trainable') and m.trainable): m.eval()
+    if (hasattr(m, 'running_mean') and
+        (getattr(m,'bn_freeze',False) or not getattr(m,'trainable',False))): m.eval()
     else: m.train()
 
 
@@ -61,17 +63,12 @@ def fit(model, data, epochs, opt, crit, metrics=None, callbacks=None, **kwargs):
     """ Fits a model
 
     Arguments:
-       model (model):example:
-           net = nn.Sequential(
-               nn.Linear(28*28, 256),
-               nn.ReLU(),
-               nn.Linear(256, 10)
-           ).cuda()
-       data (DataModel): see examples of DataModel
-           it data loaders: data.trn_dl and data.val_dl
-       opt: optimization. Example: opt=optim.Adam(net.parameters())
+       model (model): any pytorch module
+           net = to_gpu(net)
+       data (ModelData): see ModelData class and subclasses
+       opt: optimizer. Example: opt=optim.Adam(net.parameters())
        epochs(int): number of epochs
-       crit: loss function to optimize. Example: F.cross_entropy 
+       crit: loss function to optimize. Example: F.cross_entropy
     """
     stepper = Stepper(model, opt, crit, **kwargs)
     metrics = metrics or []
@@ -93,7 +90,7 @@ def fit(model, data, epochs, opt, crit, metrics=None, callbacks=None, **kwargs):
             if stop: return
 
         vals = validate(stepper, data.val_dl, metrics)
-        print(np.round([epoch, avg_loss] + vals, 6))
+        print(np.round([epoch, debias_loss] + vals, 6))
         stop=False
         for cb in callbacks: stop = stop or cb.on_epoch_end(vals)
         if stop: break
@@ -107,11 +104,11 @@ def validate(stepper, dl, metrics):
         res.append([f(to_np(preds),to_np(y)) for f in metrics])
     return [np.mean(loss)] + list(np.mean(np.stack(res),0))
 
-def predict(m, dl): return predict_with_targs(m, dl)[0]
-
 def get_prediction(x):
     if isinstance(x,(tuple,list)): x=x[0]
     return x.data
+
+def predict(m, dl): return predict_with_targs(m, dl)[0]
 
 def predict_with_targs(m, dl):
     m.eval()
@@ -119,4 +116,43 @@ def predict_with_targs(m, dl):
     preda,targa = zip(*[(get_prediction(m(*VV(x))),y)
                         for *x,y in iter(dl)])
     return to_np(torch.cat(preda)), to_np(torch.cat(targa))
+
+# From https://github.com/ncullen93/torchsample
+def model_summary(m, input_size):
+    def register_hook(module):
+        def hook(module, input, output):
+            class_name = str(module.__class__).split('.')[-1].split("'")[0]
+            module_idx = len(summary)
+
+            m_key = '%s-%i' % (class_name, module_idx+1)
+            summary[m_key] = OrderedDict()
+            summary[m_key]['input_shape'] = list(input[0].size())
+            summary[m_key]['input_shape'][0] = -1
+            summary[m_key]['output_shape'] = list(output.size())
+            summary[m_key]['output_shape'][0] = -1
+
+            params = 0
+            if hasattr(module, 'weight'):
+                params += torch.prod(torch.LongTensor(list(module.weight.size())))
+                summary[m_key]['trainable'] = module.weight.requires_grad
+            if hasattr(module, 'bias') and module.bias is not None:
+                params +=  torch.prod(torch.LongTensor(list(module.bias.size())))
+            summary[m_key]['nb_params'] = params
+
+        if (not isinstance(module, nn.Sequential) and
+           not isinstance(module, nn.ModuleList) and
+           not (module == m)):
+            hooks.append(module.register_forward_hook(hook))
+
+    summary = OrderedDict()
+    hooks = []
+    m.apply(register_hook)
+
+    if isinstance(input_size[0], (list, tuple)):
+        x = [to_gpu(Variable(torch.rand(1,*in_size))) for in_size in input_size]
+    else: x = [to_gpu(Variable(torch.rand(1,*input_size)))]
+    m(*x)
+
+    for h in hooks: h.remove()
+    return summary
 
